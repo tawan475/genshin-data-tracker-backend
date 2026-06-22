@@ -1,4 +1,6 @@
+import { DictionaryModule } from './dictionary/dictionary.module';
 import { Module } from '@nestjs/common';
+import { PrismaModule } from './prisma.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
@@ -8,7 +10,9 @@ import { GoodsModule } from './goods/goods.module';
 import { ImportModule } from './import/import.module';
 
 @Module({
-  imports: [AuthModule, UsersModule, GenshinAccountsModule, GoodsModule, ImportModule],
+  imports: [
+    PrismaModule,
+    DictionaryModule,AuthModule, UsersModule, GenshinAccountsModule, GoodsModule, ImportModule],
   controllers: [AppController],
   providers: [AppService],
 })

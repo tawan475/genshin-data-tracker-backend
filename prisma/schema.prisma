@@ -37,6 +37,13 @@ model GenshinAccount {
   user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   goods            Good[]
   accountArtifacts AccountArtifact[]
+
+}
+
+enum DictionaryType {
+  CHARACTER
+  WEAPON
+  MATERIAL
 }
 
 model Good {
@@ -49,7 +56,7 @@ model Good {
   deletedAt        DateTime?
   fileSize         Int      @default(0)
   compressedFileSize Int     @default(0)
-  characters       Json     @default("[]")
+  characters       Json     @default("{}")
   weapons          Json     @default("[]")
   materials        Json     @default("{}")
   achievements     Json     @default("[]")
@@ -83,3 +90,11 @@ model AccountArtifact {
   
   @@unique([genshinAccountId, hash])
 }
+model Dictionary {
+  id    Int            @id @default(autoincrement())
+  type  DictionaryType
+  key   String
+  
+  @@unique([type, key])
+}
+

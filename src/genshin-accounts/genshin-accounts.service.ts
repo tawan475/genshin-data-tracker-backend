@@ -6,11 +6,15 @@ import { gzipSync } from 'zlib';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { PaginatedResult } from '../common/interfaces/api-response.interface';
 import { PrismaService } from '../prisma.service';
+import { DictionaryService } from '../dictionary/dictionary.service';
+import { DataPacker, CHARACTER_SCHEMA, WEAPON_SCHEMA } from '../common/utils/data-packer.util';
+import { DictionaryType } from '@prisma/client';
+
 import { CreateGenshinAccountDto } from './dto/create-genshin-account.dto';
 
 @Injectable()
 export class GenshinAccountsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService, private readonly dictionaryService: DictionaryService) {}
 
   async generateImportKey(userId: number, accountId: number) {
     const account = await this.prisma.genshinAccount.findUnique({
@@ -245,14 +249,39 @@ export class GenshinAccountsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      const characters = Array.isArray(parsedData.characters) ? parsedData.characters : [];
-      const weapons = Array.isArray(parsedData.weapons) ? parsedData.weapons : [];
+      const charactersRaw = Array.isArray(parsedData.characters) ? parsedData.characters : [];
+      const weaponsRaw = Array.isArray(parsedData.weapons) ? parsedData.weapons : [];
       
-      let materials = {};
+      let materialsRaw: Record<string, number> = {};
       if (parsedData.materials && typeof parsedData.materials === 'object' && !Array.isArray(parsedData.materials)) {
-        materials = parsedData.materials;
+        materialsRaw = parsedData.materials as Record<string, number>;
       }
+
+      const packer = new DataPacker(this.dictionaryService);
       
+      // Pre-resolve all keys
+      await packer.preResolve(CHARACTER_SCHEMA, charactersRaw);
+      await packer.preResolve(WEAPON_SCHEMA, weaponsRaw);
+      
+      const packedCharacters: Record<string, any[]> = {};
+      for (const char of charactersRaw) {
+        const id = await this.dictionaryService.getId(DictionaryType.CHARACTER, char.key);
+        packedCharacters[id.toString()] = packer.pack(CHARACTER_SCHEMA, char);
+      }
+
+      const packedWeapons: any[][] = [];
+      for (const weapon of weaponsRaw) {
+        packedWeapons.push(packer.pack(WEAPON_SCHEMA, weapon));
+      }
+
+      const packedMaterials: Record<string, number> = {};
+      for (const [key, val] of Object.entries(materialsRaw)) {
+        if (typeof val === 'number') {
+          const id = await this.dictionaryService.getId(DictionaryType.MATERIAL, key);
+          packedMaterials[id.toString()] = val;
+        }
+      }
+
       const achievements = Array.isArray(parsedData.gi_achievements) ? parsedData.gi_achievements : (Array.isArray(parsedData.achievements) ? parsedData.achievements : []);
 
       const artifactHashList: string[] = [];
@@ -320,11 +349,11 @@ export class GenshinAccountsService {
           select: { id: true, hash: true }
         });
         const hashToId = new Map(resolvedArtifacts.map(a => [a.hash, a.id]));
-        artifactIds = artifactHashList.map(h => hashToId.get(h)!).filter(Boolean);
+        artifactIds = artifactHashList.map(h => hashToId.get(h)!).filter((x): x is number => typeof x === 'number');
       }
 
       // Compute compressed file size (gzip of stored payload)
-      const storedPayload = JSON.stringify({ characters, weapons, materials, achievements, artifactIds });
+      const storedPayload = JSON.stringify({ characters: packedCharacters, weapons: packedWeapons, materials: packedMaterials, achievements, artifactIds });
       const compressedFileSize = gzipSync(Buffer.from(storedPayload)).byteLength;
 
       // Create the Good snapshot with JSONB payloads
@@ -337,9 +366,9 @@ export class GenshinAccountsService {
           fileSize: file.size || 0,
           compressedFileSize,
           genshinAccountId: accountId,
-          characters,
-          weapons,
-          materials,
+          characters: packedCharacters,
+          weapons: packedWeapons,
+          materials: packedMaterials,
           achievements,
           artifactIds
         },
@@ -382,14 +411,19 @@ export class GenshinAccountsService {
       totalCompressedFileSize += snap.compressedFileSize || 0;
     }
 
+    const moraId = await this.dictionaryService.getId(DictionaryType.MATERIAL, 'Mora');
+    const primogemId = await this.dictionaryService.getId(DictionaryType.MATERIAL, 'Primogem');
+
     const timeline = snapshots.map(snap => {
-      const mats = snap.materials as Record<string, number> || {};
-      const chars = snap.characters as any[] || [];
+      const mats = (snap.materials || {}) as Record<string, number>;
+      const chars = (snap.characters || {}) as Record<string, any>;
+      const weaps = (snap.weapons || []) as any[];
+
       return {
         timestamp: snap.createdAt,
-        mora: mats['Mora'] || 0,
-        primogem: mats['Primogem'] || 0,
-        totalCharacters: chars.length,
+        mora: mats[moraId.toString()] || 0,
+        primogem: mats[primogemId.toString()] || 0,
+        totalCharacters: Object.keys(chars).length,
         totalArtifacts: snap.artifactIds?.length || 0,
       };
     });
@@ -449,10 +483,10 @@ export class GenshinAccountsService {
     const formattedItems = items.map(item => ({
       ...item,
       _count: {
-        characters: (item.characters as any[])?.length || 0,
+        characters: Object.keys((item.characters || {}) as Record<string, any>).length,
         artifacts: item.artifactIds?.length || 0,
-        weapons: (item.weapons as any[])?.length || 0,
-        materials: Object.keys(item.materials || {}).length,
+        weapons: ((item.weapons || []) as any[]).length,
+        materials: Object.keys((item.materials || {}) as Record<string, any>).length,
         achievements: (item.achievements as any[])?.length || 0,
       }
     }));
@@ -519,14 +553,37 @@ export class GenshinAccountsService {
       }));
     }
 
+    const packer = new DataPacker(this.dictionaryService);
+    
+    let characters: any[] = [];
+    const packedChars = (good.characters || {}) as Record<string, any[]>;
+    for (const [idStr, arr] of Object.entries(packedChars)) {
+      const obj = packer.unpack(CHARACTER_SCHEMA, arr);
+      characters.push(obj);
+    }
+    
+    let weapons: any[] = [];
+    const packedWeapons = (good.weapons || []) as any[][];
+    for (const arr of packedWeapons) {
+      const obj = packer.unpack(WEAPON_SCHEMA, arr);
+      weapons.push(obj);
+    }
+    
+    let materials: Record<string, number> = {};
+    const packedMaterials = (good.materials || {}) as Record<string, number>;
+    for (const [idStr, val] of Object.entries(packedMaterials)) {
+      const key = this.dictionaryService.getKey(parseInt(idStr, 10));
+      if (key) materials[key] = val;
+    }
+
     const result: any = {
       format: good.format,
       version: good.version,
       source: good.source,
-      characters: good.characters,
+      characters,
       artifacts,
-      weapons: good.weapons,
-      materials: good.materials,
+      weapons,
+      materials,
     };
 
     if (good.achievements && Array.isArray(good.achievements)) {
@@ -575,34 +632,42 @@ export class GenshinAccountsService {
     }
 
     const idArray = Array.from(allArtifactIds);
-    const idToRarity = new Map<number, number>();
+    const idToArtInfo = new Map<number, { rarity: number; lock: boolean }>();
 
     if (idArray.length > 0) {
       const dbArtifacts = await this.prisma.accountArtifact.findMany({
         where: { genshinAccountId: accountId, id: { in: idArray } },
-        select: { id: true, rarity: true }
+        select: { id: true, rarity: true, lock: true }
       });
       for (const art of dbArtifacts) {
-        idToRarity.set(art.id, art.rarity);
+        idToArtInfo.set(art.id, { rarity: art.rarity, lock: art.lock });
       }
     }
 
+    const moraId = (await this.dictionaryService.getId(DictionaryType.MATERIAL, 'Mora')).toString();
+    const primogemId = (await this.dictionaryService.getId(DictionaryType.MATERIAL, 'Primogem')).toString();
+    const essenceId = (await this.dictionaryService.getId(DictionaryType.MATERIAL, 'Sanctifying Essence')).toString();
+    const unctionId = (await this.dictionaryService.getId(DictionaryType.MATERIAL, 'Sanctifying Unction')).toString();
+
     const getSnapshotStats = (snap: any) => {
       if (!snap) return null;
-      const mats = snap.materials as Record<string, number> || {};
-      const mora = mats['Mora'] || 0;
-      const primogem = mats['Primogem'] || 0;
+      const mats = (snap.materials || {}) as Record<string, number>;
       
-      const extract4 = mats['SanctifyingEssence'] || mats['Sanctifying Essence'] || 0;
-      const extract3 = mats['SanctifyingUnction'] || mats['Sanctifying Unction'] || 0;
+      const mora = mats[moraId] || 0;
+      const primogem = mats[primogemId] || 0;
+      
+      const extract4 = mats[essenceId] || 0;
+      const extract3 = mats[unctionId] || 0;
       
       let art3 = 0;
       let art4 = 0;
       if (snap.artifactIds) {
         for (const artId of snap.artifactIds) {
-          const r = idToRarity.get(artId);
-          if (r === 3) art3++;
-          else if (r === 4) art4++;
+          const info = idToArtInfo.get(artId);
+          if (info && !info.lock) {
+            if (info.rarity === 3) art3++;
+            else if (info.rarity === 4) art4++;
+          }
         }
       }
 
