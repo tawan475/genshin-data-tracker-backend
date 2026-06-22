@@ -1,0 +1,85 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  moduleFormat    = "cjs"
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id              Int              @id @default(autoincrement())
+  username        String           @unique
+  password        String
+  refreshTokens   String[]         @default([])
+  genshinAccounts GenshinAccount[]
+}
+
+enum GenshinServer {
+  AMERICA
+  EUROPE
+  ASIA
+  SAR
+}
+
+model GenshinAccount {
+  id          Int            @id @default(autoincrement())
+  accountName String?
+  uid           String?
+  server        GenshinServer?
+  importKeyHash String
+  userId        Int
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  goods            Good[]
+  accountArtifacts AccountArtifact[]
+}
+
+model Good {
+  id               Int                 @id @default(autoincrement())
+  format           String
+  version          Int
+  source           String   @default("Unknown")
+  createdAt        DateTime @default(now())
+  isDeleted        Boolean  @default(false)
+  deletedAt        DateTime?
+  fileSize         Int      @default(0)
+  compressedFileSize Int     @default(0)
+  characters       Json     @default("[]")
+  weapons          Json     @default("[]")
+  materials        Json     @default("{}")
+  achievements     Json     @default("[]")
+
+  artifactIds      Int[]
+
+  genshinAccountId Int
+  genshinAccount   GenshinAccount      @relation(fields: [genshinAccountId], references: [id], onDelete: Cascade)
+}
+
+model AccountArtifact {
+  id               Int      @id @default(autoincrement())
+  hash             String
+  genshinAccountId Int
+  genshinAccount   GenshinAccount @relation(fields: [genshinAccountId], references: [id], onDelete: Cascade)
+  
+  setKey           String
+  slotKey          String
+  level            Int
+  rarity           Int
+  mainStatKey      String
+  location         String
+  lock             Boolean
+  totalRolls       Int      @default(0)
+  astralMark       Boolean  @default(false)
+  elixerCrafted    Boolean  @default(false)
+  
+  substats         Json     @default("[]")
+  
+  createdAt        DateTime @default(now())
+  
+  @@unique([genshinAccountId, hash])
+}
