@@ -7,7 +7,7 @@ import { ResponseInterceptor } from './common/interceptors/response.interceptor'
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule, {
-    logger: ['error', 'warn'],
+    logger: ['error', 'warn', 'log'],
   });
   app.enableCors();
   app.useGlobalPipes(new ValidationPipe({ transform: true }));
