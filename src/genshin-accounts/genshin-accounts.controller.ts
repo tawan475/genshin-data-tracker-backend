@@ -12,6 +12,7 @@ import {
   UseInterceptors,
   UploadedFile,
   UploadedFiles,
+  Res,
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
 import { GenshinAccountsService } from './genshin-accounts.service';
@@ -108,6 +109,45 @@ export class GenshinAccountsController {
     }
     return this.genshinAccountsService.importBulkData(userId, id, files, timestamps);
   }
+
+  @Post(':id/import-bulk-stream')
+  @UseInterceptors(FilesInterceptor('files'))
+  async importBulkStream(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @UploadedFiles() files: any[],
+    @Res() res: any,
+    @Body('timestamps') timestampsStr?: string,
+  ) {
+    let timestamps: (string | undefined)[] = [];
+    if (timestampsStr) {
+      try {
+        timestamps = JSON.parse(timestampsStr);
+      } catch (e) {
+        timestamps = [];
+      }
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const results = await this.genshinAccountsService.importBulkData(
+      userId, 
+      id, 
+      files, 
+      timestamps,
+      (progressData) => {
+        // Write each progress update as NDJSON
+        res.write(JSON.stringify({ type: 'progress', ...progressData }) + '\n');
+      }
+    );
+
+    // Write final results
+    res.write(JSON.stringify({ type: 'complete', results }) + '\n');
+    res.end();
+  }
+
 
   @Get(':id/overview')
   getOverview(

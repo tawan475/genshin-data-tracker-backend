@@ -142,7 +142,13 @@ export class GenshinAccountsService {
     return this.processImport(account.id, file, timestamp);
   }
 
-  async importBulkData(userId: number, id: number, files: any[], timestamps: (string | undefined)[]) {
+  async importBulkData(
+    userId: number, 
+    id: number, 
+    files: any[], 
+    timestamps: (string | undefined)[],
+    onProgress?: (data: { processed: number, total: number, filename: string, status: string, message?: string }) => void
+  ) {
     if (files.length > 50) {
       throw new BadRequestException('Maximum of 50 files allowed per bulk import.');
     }
@@ -157,6 +163,15 @@ export class GenshinAccountsService {
 
     const results: { filename: string; status: string; message?: string }[] = [];
     this.logger.log(`Starting bulk import for account ${id} with ${files.length} files`);
+    let processedFiles = 0;
+    const totalFiles = files.length;
+    
+    const notifyProgress = (filename: string, status: string, message?: string) => {
+      processedFiles++;
+      if (onProgress) {
+        onProgress({ processed: processedFiles, total: totalFiles, filename, status, message });
+      }
+    };
     
     // 1. Pair up files with timestamps and compute Date objects for strict chronological sorting
     const fileEntries = files.map((file, idx) => {
@@ -194,9 +209,11 @@ export class GenshinAccountsService {
       try {
         await this.processImport(account.id, firstEntry.file, firstEntry.timestamp, artifactCache);
         results.push({ filename: firstEntry.file.originalname, status: 'success' });
+        notifyProgress(firstEntry.file.originalname, 'success');
         this.logger.log(`[Phase 1] Successfully processed ${firstEntry.file.originalname}. Caches warmed up!`);
       } catch (error: any) {
         results.push({ filename: firstEntry.file.originalname, status: 'error', message: error.message });
+        notifyProgress(firstEntry.file.originalname, 'error', error.message);
         this.logger.error(`[Phase 1] Error processing ${firstEntry.file.originalname}: ${error.message}`);
       }
     }
@@ -208,19 +225,28 @@ export class GenshinAccountsService {
       const concurrencyLimit = parseInt(process.env.IMPORT_CONCURRENCY_LIMIT || '10', 10);
       for (let i = 0; i < remainingEntries.length; i += concurrencyLimit) {
         const chunk = remainingEntries.slice(i, i + concurrencyLimit);
-        await Promise.all(
-          chunk.map(async (entry) => {
-            this.logger.log(`[Phase 2] Processing file: ${entry.file.originalname}...`);
-            try {
-              await this.processImport(account.id, entry.file, entry.timestamp, artifactCache);
-              results.push({ filename: entry.file.originalname, status: 'success' });
-              this.logger.log(`[Phase 2] Successfully processed ${entry.file.originalname}`);
-            } catch (error: any) {
-              results.push({ filename: entry.file.originalname, status: 'error', message: error.message });
-              this.logger.error(`[Phase 2] Error processing ${entry.file.originalname}: ${error.message}`);
-            }
-          })
+        const chunkPromises = chunk.map(async (entry) => {
+          this.logger.log(`[Phase 2] Processing file: ${entry.file.originalname}...`);
+          try {
+            await this.processImport(account.id, entry.file, entry.timestamp, artifactCache);
+            results.push({ filename: entry.file.originalname, status: 'success' });
+            this.logger.log(`[Phase 2] Successfully processed ${entry.file.originalname}`);
+          } catch (error: any) {
+            results.push({ filename: entry.file.originalname, status: 'error', message: error.message });
+            notifyProgress(entry.file.originalname, 'error', error.message);
+            this.logger.error(`[Phase 2] Error processing ${entry.file.originalname}: ${error.message}`);
+          }
+        });
+
+        await Promise.allSettled(chunkPromises);
+        
+        // Find successes in this chunk and notify them (errors are handled in catch block)
+        const successEntries = chunk.filter(entry => 
+          results.some(r => r.filename === entry.file.originalname && r.status === 'success')
         );
+        for (const entry of successEntries) {
+          notifyProgress(entry.file.originalname, 'success');
+        }
       }
     }
 
