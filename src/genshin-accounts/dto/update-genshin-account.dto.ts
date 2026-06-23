@@ -13,4 +13,7 @@ export class UpdateGenshinAccountDto {
   @IsOptional()
   @IsEnum(GenshinServer)
   server?: GenshinServer;
+
+  @IsOptional()
+  isGlobalArtifactRankingOptIn?: boolean;
 }

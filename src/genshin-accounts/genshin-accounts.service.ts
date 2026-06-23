@@ -11,7 +11,7 @@ import { DataPacker, CHARACTER_SCHEMA, WEAPON_SCHEMA } from '../common/utils/dat
 import { DictionaryType } from '@prisma/client';
 
 import { CreateGenshinAccountDto } from './dto/create-genshin-account.dto';
-
+import { calculateCV, calculateRV } from '../common/utils/artifact.util';
 @Injectable()
 export class GenshinAccountsService {
   private readonly logger = new Logger(GenshinAccountsService.name);
@@ -397,7 +397,9 @@ export class GenshinAccountsService {
             totalRolls: art.totalRolls || 0,
             astralMark: Boolean(art.astralMark),
             elixerCrafted: Boolean(art.elixerCrafted),
-            substats: art.substats || []
+            substats: art.substats || [],
+            cv: calculateCV(art.substats || []),
+            rv: calculateRV(art.substats || [])
           });
         }
       }
@@ -831,6 +833,52 @@ export class GenshinAccountsService {
     return result;
   }
 
+  async getArtifacts(userId: number, id: number, sortBy: string, search: string | undefined, pagination: PaginationDto) {
+    const account = await this.prisma.genshinAccount.findUnique({
+      where: { id, userId },
+    });
+    if (!account) throw new NotFoundException('Account not found');
+
+    const latestGood = await this.prisma.good.findFirst({
+      where: { genshinAccountId: id, isDeleted: false },
+      orderBy: { createdAt: 'desc' },
+      select: { artifactIds: true }
+    });
+
+    const whereClause: any = { genshinAccountId: id };
+    
+    if (latestGood) {
+      whereClause.id = { in: latestGood.artifactIds };
+    } else {
+      // If no valid export exists, return no artifacts
+      whereClause.id = { in: [] };
+    }
+
+    if (search) {
+      whereClause.setKey = { contains: search, mode: 'insensitive' };
+    }
+
+    const [items, total] = await Promise.all([
+      this.prisma.accountArtifact.findMany({
+        where: whereClause,
+        orderBy: [{ [sortBy]: 'desc' }, { id: 'asc' }],
+        skip: pagination.skip,
+        take: pagination.take
+      }),
+      this.prisma.accountArtifact.count({ where: whereClause }),
+    ]);
+
+    return { 
+      items, 
+      meta: {
+        total,
+        page: pagination.page,
+        limit: pagination.limit,
+        totalPages: Math.ceil(total / pagination.limit),
+      }
+    };
+  }
+
   async getMonthlyAnalysis(userId: number, accountId: number, month: number, year: number) {
     const account = await this.prisma.genshinAccount.findUnique({
       where: { id: accountId, userId },
@@ -1010,5 +1058,41 @@ export class GenshinAccountsService {
     }
 
     return { success: true };
+  }
+
+  async deleteSnapshots(userId: number, accountId: number, snapshotIds: number[], selectAll?: boolean | string) {
+    const account = await this.prisma.genshinAccount.findUnique({
+      where: { id: accountId, userId },
+    });
+    if (!account) throw new NotFoundException('Account not found');
+
+    const isSelectAll = selectAll === true || selectAll === 'true';
+
+    if (!isSelectAll && (!snapshotIds || snapshotIds.length === 0)) {
+      return { message: 'No snapshots provided for deletion' };
+    }
+
+    try {
+      const whereClause: any = {
+        genshinAccountId: accountId,
+        isDeleted: false 
+      };
+      
+      if (!isSelectAll) {
+        whereClause.id = { in: snapshotIds };
+      }
+
+      const result = await this.prisma.good.updateMany({
+        where: whereClause,
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+        },
+      });
+      return { message: `Successfully deleted ${result.count} snapshots`, count: result.count };
+    } catch (error: any) {
+      this.logger.error('Failed to bulk delete snapshots', error.stack);
+      throw new BadRequestException('Failed to delete snapshots');
+    }
   }
 }

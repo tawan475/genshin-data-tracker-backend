@@ -33,6 +33,7 @@ model GenshinAccount {
   uid           String?
   server        GenshinServer?
   importKeyHash String
+  isGlobalArtifactRankingOptIn Boolean @default(false)
   userId        Int
   user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   goods            Good[]
@@ -88,6 +89,9 @@ model AccountArtifact {
   elixerCrafted    Boolean  @default(false)
   
   substats         Json     @default("[]")
+  
+  cv               Float    @default(0)
+  rv               Float    @default(0)
   
   createdAt        DateTime @default(now())
   

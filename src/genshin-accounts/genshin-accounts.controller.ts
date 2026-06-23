@@ -54,6 +54,8 @@ export class GenshinAccountsController {
     return this.genshinAccountsService.findAllByUser(userId, pagination);
   }
 
+
+
   @Get(':id')
   findOne(@Param('id', ParseIntPipe) id: number) {
     return this.genshinAccountsService.findOne(id);
@@ -139,6 +141,17 @@ export class GenshinAccountsController {
     return this.genshinAccountsService.getSnapshots(userId, id, pagination);
   }
 
+  @Get(':id/artifacts')
+  getArtifacts(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Query() pagination: PaginationDto,
+    @Query('sortBy') sortBy?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.genshinAccountsService.getArtifacts(userId, id, sortBy || 'cv', search, pagination);
+  }
+
   @Get(':id/export/latest')
   exportLatestSnapshot(
     @User('id') userId: number,
@@ -169,6 +182,16 @@ export class GenshinAccountsController {
       month ? parseInt(month, 10) : new Date().getUTCMonth() + 1,
       year ? parseInt(year, 10) : new Date().getUTCFullYear()
     );
+  }
+
+  @Post(':id/snapshots/bulk-delete')
+  deleteSnapshots(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Body('snapshotIds') snapshotIds: number[],
+    @Body('selectAll') selectAll?: boolean,
+  ) {
+    return this.genshinAccountsService.deleteSnapshots(userId, id, snapshotIds, selectAll);
   }
 
   @Delete(':id/snapshots/:snapshotId')
