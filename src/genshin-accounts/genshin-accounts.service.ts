@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, UnauthorizedException, ConflictException, Logger } from '@nestjs/common';
 import { GenshinServer } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
@@ -14,6 +14,8 @@ import { CreateGenshinAccountDto } from './dto/create-genshin-account.dto';
 
 @Injectable()
 export class GenshinAccountsService {
+  private readonly logger = new Logger(GenshinAccountsService.name);
+
   constructor(private readonly prisma: PrismaService, private readonly dictionaryService: DictionaryService) {}
 
   async generateImportKey(userId: number, accountId: number) {
@@ -150,17 +152,23 @@ export class GenshinAccountsService {
     }
 
     const results: { filename: string; status: string; message?: string }[] = [];
+    this.logger.log(`Starting bulk import for account ${id} with ${files.length} files`);
+    
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const timestamp = timestamps[i];
+      this.logger.log(`[${i + 1}/${files.length}] Processing file: ${file.originalname}...`);
       try {
         await this.processImport(account.id, file, timestamp);
         results.push({ filename: file.originalname, status: 'success' });
+        this.logger.log(`[${i + 1}/${files.length}] Successfully processed ${file.originalname}`);
       } catch (error: any) {
         results.push({ filename: file.originalname, status: 'error', message: error.message });
+        this.logger.error(`[${i + 1}/${files.length}] Error processing ${file.originalname}: ${error.message}`);
       }
     }
 
+    this.logger.log(`Completed bulk import for account ${id}.`);
     return { results };
   }
 
@@ -227,11 +235,13 @@ export class GenshinAccountsService {
     // Determine timestamp
     const importTimestamp = timestamp ? new Date(isNaN(Number(timestamp)) ? timestamp : Number(timestamp)) : new Date();
 
+    this.logger.log(`Parsing JSON for file (size: ${(file.size / 1024 / 1024).toFixed(2)} MB)...`);
     // Parse JSON
     let parsedData: any;
     try {
       parsedData = JSON.parse(file.buffer.toString('utf-8'));
     } catch (e) {
+      this.logger.error('Failed to parse JSON file');
       throw new Error('Invalid JSON file format');
     }
 
@@ -248,32 +258,43 @@ export class GenshinAccountsService {
       throw new ConflictException('A snapshot with this exact timestamp already exists for this account.');
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      const charactersRaw = Array.isArray(parsedData.characters) ? parsedData.characters : [];
-      const weaponsRaw = Array.isArray(parsedData.weapons) ? parsedData.weapons : [];
-      
-      let materialsRaw: Record<string, number> = {};
-      if (parsedData.materials && typeof parsedData.materials === 'object' && !Array.isArray(parsedData.materials)) {
-        materialsRaw = parsedData.materials as Record<string, number>;
-      }
+    const charactersRaw = Array.isArray(parsedData.characters) ? parsedData.characters : [];
+    const weaponsRaw = Array.isArray(parsedData.weapons) ? parsedData.weapons : [];
+    
+    let materialsRaw: Record<string, number> = {};
+    if (parsedData.materials && typeof parsedData.materials === 'object' && !Array.isArray(parsedData.materials)) {
+      materialsRaw = parsedData.materials as Record<string, number>;
+    }
 
-      const packer = new DataPacker(this.dictionaryService);
+    const packer = new DataPacker(this.dictionaryService);
+    
+    this.logger.log(`Pre-resolving dictionaries for ${charactersRaw.length} characters, ${weaponsRaw.length} weapons, and ${Object.keys(materialsRaw).length} materials...`);
+    // Pre-resolve all keys outside the transaction to prevent holding the connection
+    await packer.preResolve(CHARACTER_SCHEMA, charactersRaw);
+    await packer.preResolve(WEAPON_SCHEMA, weaponsRaw);
+    await Promise.all(
+      Object.keys(materialsRaw).map(key => 
+        this.dictionaryService.getId(DictionaryType.MATERIAL, key)
+      )
+    );
+
+    await this.prisma.$transaction(async (tx) => {
+      this.logger.log(`Starting DB transaction for import...`);
       
-      // Pre-resolve all keys
-      await packer.preResolve(CHARACTER_SCHEMA, charactersRaw);
-      await packer.preResolve(WEAPON_SCHEMA, weaponsRaw);
-      
+      this.logger.log(`Packing ${charactersRaw.length} characters...`);
       const packedCharacters: Record<string, any[]> = {};
       for (const char of charactersRaw) {
         const id = await this.dictionaryService.getId(DictionaryType.CHARACTER, char.key);
         packedCharacters[id.toString()] = packer.pack(CHARACTER_SCHEMA, char);
       }
 
+      this.logger.log(`Packing ${weaponsRaw.length} weapons...`);
       const packedWeapons: any[][] = [];
       for (const weapon of weaponsRaw) {
         packedWeapons.push(packer.pack(WEAPON_SCHEMA, weapon));
       }
 
+      this.logger.log(`Packing ${Object.keys(materialsRaw).length} materials...`);
       const packedMaterials: Record<string, number> = {};
       for (const [key, val] of Object.entries(materialsRaw)) {
         if (typeof val === 'number') {
@@ -284,6 +305,8 @@ export class GenshinAccountsService {
 
       const achievements = Array.isArray(parsedData.gi_achievements) ? parsedData.gi_achievements : (Array.isArray(parsedData.achievements) ? parsedData.achievements : []);
 
+      const numArtifacts = Array.isArray(parsedData.artifacts) ? parsedData.artifacts.length : 0;
+      this.logger.log(`Hashing ${numArtifacts} artifacts...`);
       const artifactHashList: string[] = [];
       const artifactsToInsert: any[] = [];
       
@@ -333,6 +356,7 @@ export class GenshinAccountsService {
       }
       const uniqueArtifacts = Array.from(uniqueArtifactsMap.values());
 
+      this.logger.log(`Inserting ${uniqueArtifacts.length} unique artifacts (skipping duplicates)...`);
       // Create Many AccountArtifacts (skipDuplicates: true will ignore existing hashes)
       if (uniqueArtifacts.length > 0) {
         await tx.accountArtifact.createMany({
@@ -341,6 +365,7 @@ export class GenshinAccountsService {
         });
       }
 
+      this.logger.log(`Resolving artifact hashes to DB IDs...`);
       // Resolve artifact hashes to IDs
       let artifactIds: number[] = [];
       if (artifactHashList.length > 0) {
@@ -352,10 +377,12 @@ export class GenshinAccountsService {
         artifactIds = artifactHashList.map(h => hashToId.get(h)!).filter((x): x is number => typeof x === 'number');
       }
 
+      this.logger.log(`Compressing payload...`);
       // Compute compressed file size (gzip of stored payload)
       const storedPayload = JSON.stringify({ characters: packedCharacters, weapons: packedWeapons, materials: packedMaterials, achievements, artifactIds });
       const compressedFileSize = gzipSync(Buffer.from(storedPayload)).byteLength;
 
+      this.logger.log(`Creating Good snapshot record...`);
       // Create the Good snapshot with JSONB payloads
       await tx.good.create({
         data: {
@@ -373,6 +400,7 @@ export class GenshinAccountsService {
           artifactIds
         },
       });
+      this.logger.log(`Transaction successfully completed.`);
     }, {
       maxWait: 15000, // 15 seconds to wait for a connection
       timeout: 120000, // 120 seconds to finish the transaction
@@ -582,6 +610,7 @@ export class GenshinAccountsService {
   }
 
   async exportSnapshot(userId: number, accountId: number, snapshotId: number) {
+    this.logger.log(`Starting export for snapshot ${snapshotId} of account ${accountId}...`);
     const account = await this.prisma.genshinAccount.findUnique({
       where: { id: accountId, userId },
     });
@@ -593,6 +622,7 @@ export class GenshinAccountsService {
 
     if (!good) throw new NotFoundException('Snapshot not found');
 
+    this.logger.log(`Fetching ${good.artifactIds?.length || 0} artifacts from DB...`);
     let artifacts: any[] = [];
     if (good.artifactIds && good.artifactIds.length > 0) {
       const dbArtifacts = await this.prisma.accountArtifact.findMany({
@@ -618,8 +648,9 @@ export class GenshinAccountsService {
 
     const packer = new DataPacker(this.dictionaryService);
     
-    let characters: any[] = [];
     const packedChars = (good.characters || {}) as Record<string, any[]>;
+    this.logger.log(`Unpacking ${Object.keys(packedChars).length} characters...`);
+    let characters: any[] = [];
     for (const [idStr, arr] of Object.entries(packedChars)) {
       const obj = packer.unpack(CHARACTER_SCHEMA, arr);
       characters.push(obj);
