@@ -452,7 +452,70 @@ export class GenshinAccountsService {
       grouped.set(key, entry);
     }
 
-    const aggregated = Array.from(grouped.values());
+    let aggregated: (typeof timeline)[number][] = [];
+    if (timeline.length > 0) {
+      let current = new Date(timeline[0].timestamp);
+      // align current to start of the period
+      switch (groupBy) {
+        case 'year':
+          current = new Date(Date.UTC(current.getUTCFullYear(), 0, 1));
+          break;
+        case 'month':
+          current = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), 1));
+          break;
+        case 'hour':
+          current = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate(), current.getUTCHours()));
+          break;
+        case 'day':
+        default:
+          current = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate()));
+          break;
+      }
+      const end = new Date(); // fill gaps up to now
+      let lastKnown = timeline[0];
+
+      while (current <= end) {
+        let key: string;
+        switch (groupBy) {
+          case 'year':
+            key = `${current.getUTCFullYear()}`;
+            break;
+          case 'month':
+            key = `${current.getUTCFullYear()}-${String(current.getUTCMonth() + 1).padStart(2, '0')}`;
+            break;
+          case 'hour':
+            key = `${current.getUTCFullYear()}-${String(current.getUTCMonth() + 1).padStart(2, '0')}-${String(current.getUTCDate()).padStart(2, '0')} ${String(current.getUTCHours()).padStart(2, '0')}:00`;
+            break;
+          case 'day':
+          default:
+            key = `${current.getUTCFullYear()}-${String(current.getUTCMonth() + 1).padStart(2, '0')}-${String(current.getUTCDate()).padStart(2, '0')}`;
+            break;
+        }
+
+        if (grouped.has(key)) {
+          lastKnown = grouped.get(key)!;
+        }
+        // Always push a copy with the 'current' timestamp so the graph is uniformly spaced
+        aggregated.push({ ...lastKnown, timestamp: new Date(current) });
+
+        // Advance current by 1 unit
+        switch (groupBy) {
+          case 'year':
+            current.setUTCFullYear(current.getUTCFullYear() + 1);
+            break;
+          case 'month':
+            current.setUTCMonth(current.getUTCMonth() + 1);
+            break;
+          case 'hour':
+            current.setUTCHours(current.getUTCHours() + 1);
+            break;
+          case 'day':
+          default:
+            current.setUTCDate(current.getUTCDate() + 1);
+            break;
+        }
+      }
+    }
     const limited = aggregated.slice(-limit);
     return {
       timeline: limited,
@@ -632,15 +695,15 @@ export class GenshinAccountsService {
     }
 
     const idArray = Array.from(allArtifactIds);
-    const idToArtInfo = new Map<number, { rarity: number; lock: boolean }>();
+    const idToArtInfo = new Map<number, { rarity: number; lock: boolean; location: string }>();
 
     if (idArray.length > 0) {
       const dbArtifacts = await this.prisma.accountArtifact.findMany({
         where: { genshinAccountId: accountId, id: { in: idArray } },
-        select: { id: true, rarity: true, lock: true }
+        select: { id: true, rarity: true, lock: true, location: true }
       });
       for (const art of dbArtifacts) {
-        idToArtInfo.set(art.id, { rarity: art.rarity, lock: art.lock });
+        idToArtInfo.set(art.id, { rarity: art.rarity, lock: art.lock, location: art.location });
       }
     }
 
@@ -664,7 +727,7 @@ export class GenshinAccountsService {
       if (snap.artifactIds) {
         for (const artId of snap.artifactIds) {
           const info = idToArtInfo.get(artId);
-          if (info && !info.lock) {
+          if (info && !info.lock && info.location === '') {
             if (info.rarity === 3) art3++;
             else if (info.rarity === 4) art4++;
           }

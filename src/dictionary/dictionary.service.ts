@@ -9,6 +9,8 @@ export class DictionaryService implements OnModuleInit {
   private readonly cache = new Map<string, number>();
   // Maps id -> key (useful for exporting)
   private readonly reverseCache = new Map<number, string>();
+  // Maps inflight requests to prevent concurrent upserts
+  private readonly pendingRequests = new Map<string, Promise<number>>();
 
   constructor(private prisma: PrismaService) {}
 
@@ -40,26 +42,58 @@ export class DictionaryService implements OnModuleInit {
       return this.cache.get(cacheKey)!;
     }
 
-    // Cache miss: safely upsert the value to the database
-    const entry = await this.prisma.dictionary.upsert({
-      where: {
-        type_key: {
-          type,
-          key,
-        },
-      },
-      update: {},
-      create: {
-        type,
-        key,
-      },
-    });
+    if (this.pendingRequests.has(cacheKey)) {
+      return this.pendingRequests.get(cacheKey)!;
+    }
 
-    // Update caches
-    this.cache.set(cacheKey, entry.id);
-    this.reverseCache.set(entry.id, entry.key);
+    const promise = (async () => {
+      try {
+        // Cache miss: safely upsert the value to the database
+        const entry = await this.prisma.dictionary.upsert({
+          where: {
+            type_key: {
+              type,
+              key,
+            },
+          },
+          update: {},
+          create: {
+            type,
+            key,
+          },
+        });
 
-    return entry.id;
+        // Update caches
+        this.cache.set(cacheKey, entry.id);
+        this.reverseCache.set(entry.id, entry.key);
+
+        return entry.id;
+      } catch (error: any) {
+        if (error.code === 'P2002') {
+          // Unique constraint failed. This implies another transaction beat us to it.
+          // Fallback to fetch the freshly created entry.
+          const entry = await this.prisma.dictionary.findUnique({
+            where: {
+              type_key: {
+                type,
+                key,
+              },
+            },
+          });
+          if (entry) {
+            this.cache.set(cacheKey, entry.id);
+            this.reverseCache.set(entry.id, entry.key);
+            return entry.id;
+          }
+        }
+        throw error;
+      } finally {
+        this.pendingRequests.delete(cacheKey);
+      }
+    })();
+
+    this.pendingRequests.set(cacheKey, promise);
+    return promise;
   }
 
   /**
