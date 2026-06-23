@@ -51,18 +51,18 @@ export class DataPacker {
    * Pre-resolves all dictionary keys to ensure they are cached before packing.
    */
   async preResolve(schema: SchemaField[], items: any[]) {
-    const promises: Promise<number>[] = [];
+    const requests: { type: DictionaryType; rawKey: string }[] = [];
     for (const item of items) {
       for (const field of schema) {
         if (field.type === 'dictionary' && field.dictionaryType) {
           const val = field.get(item);
           if (val) {
-            promises.push(this.dictionaryService.getId(field.dictionaryType, val));
+            requests.push({ type: field.dictionaryType, rawKey: val });
           }
         }
       }
     }
-    await Promise.all(promises);
+    await this.dictionaryService.getIdsBulk(requests);
   }
 
   pack(schema: SchemaField[], item: any): any[] {

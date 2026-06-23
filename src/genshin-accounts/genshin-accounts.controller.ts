@@ -122,6 +122,14 @@ export class GenshinAccountsController {
     );
   }
 
+  @Get(':id/storage-stats')
+  getStorageStats(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+  ) {
+    return this.genshinAccountsService.getStorageStats(userId, id);
+  }
+
   @Get(':id/snapshots')
   getSnapshots(
     @User('id') userId: number,

@@ -38,6 +38,7 @@ model GenshinAccount {
   goods            Good[]
   accountArtifacts AccountArtifact[]
 
+  @@index([userId])
 }
 
 enum DictionaryType {
@@ -65,6 +66,8 @@ model Good {
 
   genshinAccountId Int
   genshinAccount   GenshinAccount      @relation(fields: [genshinAccountId], references: [id], onDelete: Cascade)
+
+  @@index([genshinAccountId, isDeleted, createdAt(sort: Desc)])
 }
 
 model AccountArtifact {

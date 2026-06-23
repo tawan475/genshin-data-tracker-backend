@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { CreateGoodDto } from './dto/create-good.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
@@ -12,6 +12,7 @@ import { DictionaryType } from '@prisma/client';
 
 @Injectable()
 export class GoodsService {
+  private readonly logger = new Logger(GoodsService.name);
   constructor(private readonly prisma: PrismaService, private readonly dictionaryService: DictionaryService) {}
 
   async create(genshinAccountId: number, dto: CreateGoodDto) {
@@ -94,9 +95,11 @@ export class GoodsService {
 
       const packer = new DataPacker(this.dictionaryService);
       
+      this.logger.log(`Pre-resolving dictionaries for ${charactersRaw.length} characters, ${weaponsRaw.length} weapons, and ${Object.keys(materialsRaw).length} materials...`);
       // Pre-resolve all keys
       await packer.preResolve(CHARACTER_SCHEMA, charactersRaw);
       await packer.preResolve(WEAPON_SCHEMA, weaponsRaw);
+      await this.dictionaryService.getIdsBulk(Object.keys(materialsRaw).map(k => ({ type: DictionaryType.MATERIAL, rawKey: k })));
       
       const packedCharacters: Record<string, any[]> = {};
       for (const char of charactersRaw) {
