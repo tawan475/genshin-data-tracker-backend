@@ -2,6 +2,7 @@ import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { DictionaryType } from '@prisma/client';
 import { toGoodKey } from '../common/utils/good.util';
+import { searchCatalogMaterials } from '../common/utils/material-catalog.util';
 
 @Injectable()
 export class DictionaryService implements OnModuleInit {
@@ -213,5 +214,12 @@ export class DictionaryService implements OnModuleInit {
    */
   getKey(id: number): string | undefined {
     return this.reverseCache.get(id);
+  }
+
+  searchMaterialKeys(
+    search: string,
+    limit: number,
+  ): { key: string; name: string }[] {
+    return searchCatalogMaterials(search, limit);
   }
 }

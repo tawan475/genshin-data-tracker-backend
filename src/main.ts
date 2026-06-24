@@ -1,4 +1,5 @@
 import { Logger, ValidationPipe } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
@@ -11,7 +12,7 @@ async function bootstrap() {
   });
   app.enableCors();
   app.useGlobalPipes(new ValidationPipe({ transform: true }));
-  app.useGlobalInterceptors(new ResponseInterceptor());
+  app.useGlobalInterceptors(new ResponseInterceptor(app.get(Reflector)));
   app.useGlobalFilters(new HttpExceptionFilter());
 
   const port = process.env.PORT ?? 3000;

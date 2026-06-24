@@ -12,11 +12,21 @@ import { DictionaryType } from '@prisma/client';
 
 import { CreateGenshinAccountDto } from './dto/create-genshin-account.dto';
 import { calculateCV, calculateRV } from '../common/utils/artifact.util';
+import { SnapshotExportService } from './snapshot-export.service';
+import {
+  aggregateTimelineByGroup,
+  formatMaterialDisplayName,
+} from '../common/utils/timeline-aggregation.util';
+import { isCatalogMaterial } from '../common/utils/material-catalog.util';
 @Injectable()
 export class GenshinAccountsService {
   private readonly logger = new Logger(GenshinAccountsService.name);
 
-  constructor(private readonly prisma: PrismaService, private readonly dictionaryService: DictionaryService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly dictionaryService: DictionaryService,
+    private readonly snapshotExportService: SnapshotExportService,
+  ) {}
 
   async generateImportKey(userId: number, accountId: number) {
     const account = await this.prisma.genshinAccount.findUnique({
@@ -89,6 +99,156 @@ export class GenshinAccountsService {
           [GenshinServer.SAR]: 'TW/HK/MO',
         },
       },
+    };
+  }
+
+  async getDashboardSummary(userId: number) {
+    const accounts = await this.prisma.genshinAccount.findMany({
+      where: { userId },
+      select: {
+        id: true,
+        accountName: true,
+        uid: true,
+        server: true,
+        _count: {
+          select: {
+            goods: { where: { isDeleted: false } },
+            accountArtifacts: true,
+          },
+        },
+      },
+    });
+
+    const accountIds = accounts.map((a) => a.id);
+
+    if (accountIds.length === 0) {
+      return {
+        summary: {
+          totalAccounts: 0,
+          activeAccounts: 0,
+          totalSnapshots: 0,
+          totalArtifacts: 0,
+          totalCharacters: 0,
+          totalStorageBytes: 0,
+          totalCompressedBytes: 0,
+          lastSyncAt: null,
+        },
+        accounts: [],
+        recentActivity: [],
+      };
+    }
+
+    const [storageAgg, totalArtifacts, latestGoods, recentActivity] =
+      await Promise.all([
+        this.prisma.good.aggregate({
+          where: {
+            genshinAccountId: { in: accountIds },
+            isDeleted: false,
+          },
+          _sum: { fileSize: true, compressedFileSize: true },
+          _count: { id: true },
+          _max: { createdAt: true },
+        }),
+        this.prisma.accountArtifact.count({
+          where: { genshinAccountId: { in: accountIds } },
+        }),
+        this.prisma.good.findMany({
+          where: {
+            genshinAccountId: { in: accountIds },
+            isDeleted: false,
+          },
+          distinct: ['genshinAccountId'],
+          orderBy: [{ genshinAccountId: 'asc' }, { createdAt: 'desc' }],
+          select: {
+            genshinAccountId: true,
+            createdAt: true,
+            characters: true,
+          },
+        }),
+        this.prisma.good.findMany({
+          where: {
+            genshinAccountId: { in: accountIds },
+            isDeleted: false,
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          select: {
+            id: true,
+            genshinAccountId: true,
+            createdAt: true,
+            fileSize: true,
+            characters: true,
+            artifactIds: true,
+            genshinAccount: { select: { accountName: true } },
+          },
+        }),
+      ]);
+
+    const latestByAccount = new Map(
+      latestGoods.map((g) => [g.genshinAccountId, g]),
+    );
+
+    let totalCharacters = 0;
+    for (const g of latestGoods) {
+      totalCharacters += Object.keys(
+        (g.characters || {}) as Record<string, unknown>,
+      ).length;
+    }
+
+    const activeAccounts = accounts.filter((a) => a._count.goods > 0).length;
+
+    const accountSummaries = accounts
+      .map((acc) => {
+        const latest = latestByAccount.get(acc.id);
+        const characterCount = latest
+          ? Object.keys(
+              (latest.characters || {}) as Record<string, unknown>,
+            ).length
+          : 0;
+        return {
+          id: acc.id,
+          accountName: acc.accountName,
+          uid: acc.uid,
+          server: acc.server,
+          snapshotCount: acc._count.goods,
+          artifactCount: acc._count.accountArtifacts,
+          characterCount,
+          lastSyncAt: latest?.createdAt ?? null,
+        };
+      })
+      .sort((a, b) => {
+        if (!a.lastSyncAt) return 1;
+        if (!b.lastSyncAt) return -1;
+        return (
+          new Date(b.lastSyncAt).getTime() - new Date(a.lastSyncAt).getTime()
+        );
+      });
+
+    return {
+      summary: {
+        totalAccounts: accounts.length,
+        activeAccounts,
+        totalSnapshots: storageAgg._count.id,
+        totalArtifacts,
+        totalCharacters,
+        totalStorageBytes: storageAgg._sum.fileSize || 0,
+        totalCompressedBytes: storageAgg._sum.compressedFileSize || 0,
+        lastSyncAt: storageAgg._max.createdAt ?? null,
+      },
+      accounts: accountSummaries,
+      recentActivity: recentActivity.map((item) => ({
+        id: item.id,
+        genshinAccountId: item.genshinAccountId,
+        accountName: item.genshinAccount.accountName,
+        createdAt: item.createdAt,
+        fileSize: item.fileSize,
+        _count: {
+          characters: Object.keys(
+            (item.characters || {}) as Record<string, unknown>,
+          ).length,
+          artifacts: item.artifactIds?.length || 0,
+        },
+      })),
     };
   }
 
@@ -674,13 +834,33 @@ export class GenshinAccountsService {
       }
     }
     const limited = aggregated.slice(-limit);
+
+    const artifactCount = await this.prisma.accountArtifact.count({
+      where: { genshinAccountId: id },
+    });
+
+    const rawLatest =
+      timeline.length > 0 ? timeline[timeline.length - 1] : null;
+
     return {
       timeline: limited,
       storage: {
         totalSnapshots: snapshots.length,
         totalFileSize,
         totalCompressedFileSize,
-      }
+      },
+      latest: rawLatest
+        ? {
+            timestamp: rawLatest.timestamp,
+            mora: rawLatest.mora,
+            primogem: rawLatest.primogem,
+            totalCharacters: rawLatest.totalCharacters,
+            totalArtifacts: rawLatest.totalArtifacts,
+          }
+        : null,
+      inventory: {
+        artifactCount,
+      },
     };
   }
 
@@ -782,81 +962,24 @@ export class GenshinAccountsService {
   }
 
   async exportSnapshot(userId: number, accountId: number, snapshotId: number) {
-    this.logger.log(`Starting export for snapshot ${snapshotId} of account ${accountId}...`);
-    const account = await this.prisma.genshinAccount.findUnique({
-      where: { id: accountId, userId },
-    });
-    if (!account) throw new NotFoundException('Account not found');
+    const { payload } = await this.snapshotExportService.exportGoodJson(
+      userId,
+      accountId,
+      snapshotId,
+    );
+    return payload;
+  }
 
-    const good = await this.prisma.good.findFirst({
-      where: { id: snapshotId, genshinAccountId: accountId, isDeleted: false }
-    });
-
-    if (!good) throw new NotFoundException('Snapshot not found');
-
-    this.logger.log(`Fetching ${good.artifactIds?.length || 0} artifacts from DB...`);
-    let artifacts: any[] = [];
-    if (good.artifactIds && good.artifactIds.length > 0) {
-      const dbArtifacts = await this.prisma.accountArtifact.findMany({
-        where: {
-          genshinAccountId: accountId,
-          id: { in: good.artifactIds }
-        }
-      });
-      
-      artifacts = dbArtifacts.map(a => ({
-        setKey: a.setKey,
-        slotKey: a.slotKey,
-        level: a.level,
-        rarity: a.rarity,
-        mainStatKey: a.mainStatKey,
-        location: a.location,
-        lock: a.lock,
-        substats: Array.isArray(a.substats) 
-          ? a.substats.map((s: any) => ({ key: s.key, value: s.value })) 
-          : []
-      }));
-    }
-
-    const packer = new DataPacker(this.dictionaryService);
-    
-    const packedChars = (good.characters || {}) as Record<string, any[]>;
-    this.logger.log(`Unpacking ${Object.keys(packedChars).length} characters...`);
-    let characters: any[] = [];
-    for (const [idStr, arr] of Object.entries(packedChars)) {
-      const obj = packer.unpack(CHARACTER_SCHEMA, arr);
-      characters.push(obj);
-    }
-    
-    let weapons: any[] = [];
-    const packedWeapons = (good.weapons || []) as any[][];
-    for (const arr of packedWeapons) {
-      const obj = packer.unpack(WEAPON_SCHEMA, arr);
-      weapons.push(obj);
-    }
-    
-    let materials: Record<string, number> = {};
-    const packedMaterials = (good.materials || {}) as Record<string, number>;
-    for (const [idStr, val] of Object.entries(packedMaterials)) {
-      const key = this.dictionaryService.getKey(parseInt(idStr, 10));
-      if (key) materials[key] = val;
-    }
-
-    const result: any = {
-      format: good.format,
-      version: good.version,
-      source: good.source,
-      characters,
-      artifacts,
-      weapons,
-      materials,
-    };
-
-    if (good.achievements && Array.isArray(good.achievements)) {
-      result.gi_achievements = good.achievements;
-    }
-
-    return result;
+  async exportSnapshotFile(
+    userId: number,
+    accountId: number,
+    snapshotId: number,
+  ) {
+    return this.snapshotExportService.exportGoodJson(
+      userId,
+      accountId,
+      snapshotId,
+    );
   }
 
   async getArtifacts(userId: number, id: number, sortBy: string, search: string | undefined, pagination: PaginationDto) {
@@ -898,9 +1021,9 @@ export class GenshinAccountsService {
       items, 
       meta: {
         total,
-        page: pagination.page,
-        limit: pagination.limit,
-        totalPages: Math.ceil(total / pagination.limit),
+        page: pagination.parsedPage,
+        limit: pagination.parsedLimit,
+        totalPages: Math.ceil(total / pagination.parsedLimit) || 1,
       }
     };
   }
@@ -1087,26 +1210,20 @@ export class GenshinAccountsService {
   }
 
   async deleteSnapshots(userId: number, accountId: number, snapshotIds: number[], selectAll?: boolean | string) {
-    const account = await this.prisma.genshinAccount.findUnique({
-      where: { id: accountId, userId },
-    });
-    if (!account) throw new NotFoundException('Account not found');
+    await this.snapshotExportService.assertAccountOwnership(userId, accountId);
 
-    const isSelectAll = selectAll === true || selectAll === 'true';
+    const isSelectAll = this.snapshotExportService.isSelectAll(selectAll);
 
     if (!isSelectAll && (!snapshotIds || snapshotIds.length === 0)) {
       return { message: 'No snapshots provided for deletion' };
     }
 
     try {
-      const whereClause: any = {
-        genshinAccountId: accountId,
-        isDeleted: false 
-      };
-      
-      if (!isSelectAll) {
-        whereClause.id = { in: snapshotIds };
-      }
+      const whereClause = this.snapshotExportService.buildSnapshotWhereClause(
+        accountId,
+        snapshotIds,
+        selectAll,
+      );
 
       const result = await this.prisma.good.updateMany({
         where: whereClause,
@@ -1117,8 +1234,147 @@ export class GenshinAccountsService {
       });
       return { message: `Successfully deleted ${result.count} snapshots`, count: result.count };
     } catch (error: any) {
+      if (error?.status === 400) throw error;
       this.logger.error('Failed to bulk delete snapshots', error.stack);
       throw new BadRequestException('Failed to delete snapshots');
     }
+  }
+
+  async getMaterialsCatalog(search: string | undefined, limit: number) {
+    const cappedLimit = Math.min(Math.max(limit || 30, 1), 100);
+    const items = this.dictionaryService.searchMaterialKeys(
+      search || '',
+      cappedLimit,
+    );
+    return { items };
+  }
+
+  async getMaterialsHistory(
+    userId: number,
+    accountId: number,
+    keys: string[],
+    groupBy: 'hour' | 'day' | 'month' | 'year' = 'day',
+    limit = 365,
+  ) {
+    const account = await this.prisma.genshinAccount.findUnique({
+      where: { id: accountId, userId },
+    });
+    if (!account) throw new NotFoundException('Account not found');
+
+    if (keys.length === 0) {
+      return { groupBy, series: [] };
+    }
+
+    const keyToId = new Map<string, string>();
+    for (const rawKey of keys) {
+      const id = await this.dictionaryService.getId(
+        DictionaryType.MATERIAL,
+        rawKey,
+      );
+      keyToId.set(rawKey, id.toString());
+    }
+
+    const snapshots = await this.prisma.good.findMany({
+      where: { genshinAccountId: accountId, isDeleted: false },
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true, materials: true },
+    });
+
+    const series = keys.map((key) => {
+      const materialId = keyToId.get(key)!;
+      const rawPoints = snapshots.map((snap) => {
+        const mats = (snap.materials || {}) as Record<string, number>;
+        return {
+          timestamp: snap.createdAt,
+          value: mats[materialId] || 0,
+        };
+      });
+
+      const aggregated = aggregateTimelineByGroup(
+        rawPoints,
+        groupBy,
+        limit,
+      );
+
+      return {
+        key,
+        name: formatMaterialDisplayName(key),
+        points: aggregated.map((p) => ({
+          timestamp: p.timestamp,
+          count: p.value,
+        })),
+      };
+    });
+
+    return { groupBy, series };
+  }
+
+  async getCurrentMaterials(
+    userId: number,
+    accountId: number,
+    search: string | undefined,
+    sortBy: string,
+    pagination: PaginationDto,
+  ) {
+    const account = await this.prisma.genshinAccount.findUnique({
+      where: { id: accountId, userId },
+    });
+    if (!account) throw new NotFoundException('Account not found');
+
+    const latestGood = await this.prisma.good.findFirst({
+      where: { genshinAccountId: accountId, isDeleted: false },
+      orderBy: { createdAt: 'desc' },
+      select: { materials: true },
+    });
+
+    if (!latestGood) {
+      return {
+        items: [],
+        meta: {
+          total: 0,
+          page: pagination.parsedPage,
+          limit: pagination.parsedLimit,
+          totalPages: 1,
+        },
+      };
+    }
+
+    const mats = (latestGood.materials || {}) as Record<string, number>;
+
+    let items = Object.entries(mats)
+      .map(([idStr, count]) => {
+        const key = this.dictionaryService.getKey(parseInt(idStr, 10)) || idStr;
+        const name = formatMaterialDisplayName(key);
+        return { key, name, count };
+      })
+      .filter((item) => isCatalogMaterial(item.key));
+
+    if (search) {
+      const needle = search.toLowerCase();
+      items = items.filter(
+        (item) =>
+          item.key.toLowerCase().includes(needle) ||
+          item.name.toLowerCase().includes(needle),
+      );
+    }
+
+    if (sortBy === 'name') {
+      items.sort((a, b) => a.name.localeCompare(b.name));
+    } else {
+      items.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    }
+
+    const total = items.length;
+    const paged = items.slice(pagination.skip, pagination.skip + pagination.take);
+
+    return {
+      items: paged,
+      meta: {
+        total,
+        page: pagination.parsedPage,
+        limit: pagination.parsedLimit,
+        totalPages: Math.ceil(total / pagination.parsedLimit) || 1,
+      },
+    };
   }
 }

@@ -13,21 +13,30 @@ import {
   UploadedFile,
   UploadedFiles,
   Res,
+  StreamableFile,
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { GenshinAccountsService } from './genshin-accounts.service';
+import { SnapshotExportService } from './snapshot-export.service';
 import { CreateGenshinAccountDto } from './dto/create-genshin-account.dto';
 import { UpdateGenshinAccountDto } from './dto/update-genshin-account.dto';
 import { DeleteGenshinAccountDto } from './dto/delete-genshin-account.dto';
+import { BulkSnapshotActionDto } from './dto/bulk-snapshot-action.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { User } from '../auth/decorators/user.decorator';
+import { SkipResponseWrap } from '../common/decorators/skip-response-wrap.decorator';
+import { SettingsService } from '../settings/settings.service';
+import { PatchAccountSettingsDto } from '../settings/dto/patch-account-settings.dto';
 
 @Controller('genshin-accounts')
 @UseGuards(JwtAuthGuard)
 export class GenshinAccountsController {
   constructor(
     private readonly genshinAccountsService: GenshinAccountsService,
+    private readonly snapshotExportService: SnapshotExportService,
+    private readonly settingsService: SettingsService,
   ) {}
 
   @Post(':id/import-key')
@@ -56,6 +65,16 @@ export class GenshinAccountsController {
   }
 
 
+
+  @Get('active-export')
+  getActiveExport(@User('id') userId: number) {
+    return this.snapshotExportService.getActiveExportForUser(userId);
+  }
+
+  @Get('dashboard-summary')
+  getDashboardSummary(@User('id') userId: number) {
+    return this.genshinAccountsService.getDashboardSummary(userId);
+  }
 
   @Get(':id')
   findOne(@Param('id', ParseIntPipe) id: number) {
@@ -192,6 +211,71 @@ export class GenshinAccountsController {
     return this.genshinAccountsService.getArtifacts(userId, id, sortBy || 'cv', search, pagination);
   }
 
+  @Get(':id/settings')
+  getAccountSettings(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+  ) {
+    return this.settingsService.getAccountSettings(userId, id);
+  }
+
+  @Patch(':id/settings')
+  patchAccountSettings(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: PatchAccountSettingsDto,
+  ) {
+    return this.settingsService.patchAccountSettings(userId, id, dto);
+  }
+
+  @Get(':id/materials/catalog')
+  getMaterialsCatalog(
+    @Query('search') search?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.genshinAccountsService.getMaterialsCatalog(
+      search,
+      limit ? parseInt(limit, 10) : 30,
+    );
+  }
+
+  @Get(':id/materials/history')
+  getMaterialsHistory(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Query('keys') keys?: string,
+    @Query('groupBy') groupBy?: 'hour' | 'day' | 'month' | 'year',
+    @Query('limit') limit?: string,
+  ) {
+    const keyList = keys
+      ? keys.split(',').map((k) => k.trim()).filter(Boolean)
+      : [];
+    return this.genshinAccountsService.getMaterialsHistory(
+      userId,
+      id,
+      keyList,
+      groupBy || 'day',
+      limit ? parseInt(limit, 10) : 365,
+    );
+  }
+
+  @Get(':id/materials')
+  getCurrentMaterials(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Query() pagination: PaginationDto,
+    @Query('sortBy') sortBy?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.genshinAccountsService.getCurrentMaterials(
+      userId,
+      id,
+      search,
+      sortBy || 'count',
+      pagination,
+    );
+  }
+
   @Get(':id/export/latest')
   exportLatestSnapshot(
     @User('id') userId: number,
@@ -201,12 +285,75 @@ export class GenshinAccountsController {
   }
 
   @Get(':id/snapshots/:snapshotId/export')
-  exportSnapshot(
+  async exportSnapshot(
     @User('id') userId: number,
     @Param('id', ParseIntPipe) id: number,
     @Param('snapshotId', ParseIntPipe) snapshotId: number,
+    @Query('attachment') attachment?: string,
   ) {
+    const wantsFile =
+      attachment === '1' || attachment === 'true' || attachment === 'attachment';
+
+    if (wantsFile) {
+      const { payload, filename } =
+        await this.genshinAccountsService.exportSnapshotFile(
+          userId,
+          id,
+          snapshotId,
+        );
+      const buffer = Buffer.from(JSON.stringify(payload), 'utf-8');
+      return new StreamableFile(buffer, {
+        type: 'application/json',
+        disposition: `attachment; filename="${filename}"`,
+      });
+    }
+
     return this.genshinAccountsService.exportSnapshot(userId, id, snapshotId);
+  }
+
+  @Post(':id/snapshots/bulk-export')
+  async bulkExport(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: BulkSnapshotActionDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result = await this.snapshotExportService.bulkExport(userId, id, dto);
+    res.status(result.httpStatus);
+    return result.body;
+  }
+
+  @Get(':id/export-jobs')
+  listExportJobs(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Query() pagination: PaginationDto,
+  ) {
+    return this.snapshotExportService.listJobs(userId, id, pagination);
+  }
+
+  @Get(':id/export-jobs/:jobId')
+  getExportJob(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Param('jobId') jobId: string,
+  ) {
+    return this.snapshotExportService.getJob(userId, id, jobId);
+  }
+
+  @Get(':id/export-jobs/:jobId/download')
+  @SkipResponseWrap()
+  async downloadExportJob(
+    @User('id') userId: number,
+    @Param('id', ParseIntPipe) id: number,
+    @Param('jobId') jobId: string,
+  ) {
+    const { stream, filename } =
+      await this.snapshotExportService.streamJobDownload(userId, id, jobId);
+    return new StreamableFile(stream, {
+      type: 'application/zip',
+      disposition: `attachment; filename="${filename}"`,
+    });
   }
 
   @Get(':id/analysis/monthly')
@@ -228,10 +375,14 @@ export class GenshinAccountsController {
   deleteSnapshots(
     @User('id') userId: number,
     @Param('id', ParseIntPipe) id: number,
-    @Body('snapshotIds') snapshotIds: number[],
-    @Body('selectAll') selectAll?: boolean,
+    @Body() dto: BulkSnapshotActionDto,
   ) {
-    return this.genshinAccountsService.deleteSnapshots(userId, id, snapshotIds, selectAll);
+    return this.genshinAccountsService.deleteSnapshots(
+      userId,
+      id,
+      dto.snapshotIds ?? [],
+      dto.selectAll,
+    );
   }
 
   @Delete(':id/snapshots/:snapshotId')

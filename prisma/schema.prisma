@@ -17,6 +17,7 @@ model User {
   username        String           @unique
   password        String
   refreshTokens   String[]         @default([])
+  settings        Json             @default("{}")
   genshinAccounts GenshinAccount[]
 }
 
@@ -34,12 +35,48 @@ model GenshinAccount {
   server        GenshinServer?
   importKeyHash String
   isGlobalArtifactRankingOptIn Boolean @default(false)
+  settings        Json             @default("{}")
   userId        Int
   user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   goods            Good[]
   accountArtifacts AccountArtifact[]
+  exportJobs       ExportJob[]
 
   @@index([userId])
+}
+
+enum ExportJobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
+model ExportJob {
+  id               String          @id @default(uuid())
+  userId           Int
+  genshinAccountId Int
+  snapshotIds      Int[]           @default([])
+  selectAll        Boolean         @default(false)
+  status           ExportJobStatus @default(PENDING)
+  progress         Int             @default(0)
+  total            Int             @default(0)
+  storagePath      String?
+  error            String?
+  lockedAt         DateTime?
+  lockedBy           String?
+  heartbeatAt      DateTime?
+  attemptCount       Int             @default(0)
+  createdAt        DateTime        @default(now())
+  expiresAt        DateTime?
+  completedAt      DateTime?
+
+  genshinAccount GenshinAccount @relation(fields: [genshinAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userId, genshinAccountId, status])
+  @@index([expiresAt])
+  @@index([status, heartbeatAt])
 }
 
 enum DictionaryType {
