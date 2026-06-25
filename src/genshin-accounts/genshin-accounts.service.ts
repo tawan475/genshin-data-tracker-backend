@@ -18,6 +18,8 @@ import {
   formatMaterialDisplayName,
 } from '../common/utils/timeline-aggregation.util';
 import { isCatalogMaterial } from '../common/utils/material-catalog.util';
+import { importConfig } from '../common/config/import.config';
+import { parseFilenameTimestamp } from '../common/utils/gdt-export.util';
 @Injectable()
 export class GenshinAccountsService {
   private readonly logger = new Logger(GenshinAccountsService.name);
@@ -309,8 +311,10 @@ export class GenshinAccountsService {
     timestamps: (string | undefined)[],
     onProgress?: (data: { processed: number, total: number, filename: string, status: string, message?: string }) => void
   ) {
-    if (files.length > 50) {
-      throw new BadRequestException('Maximum of 50 files allowed per bulk import.');
+    if (files.length > importConfig.maxFiles) {
+      throw new BadRequestException(
+        `Maximum of ${importConfig.maxFiles} files allowed per bulk import.`,
+      );
     }
 
     const account = await this.prisma.genshinAccount.findUnique({
@@ -340,15 +344,9 @@ export class GenshinAccountsService {
       if (ts) {
         dateObj = new Date(isNaN(Number(ts)) ? ts : Number(ts));
       } else {
-        // Fallback: try to extract from filename genshin_export_YYYY-MM-DD_HH-mm-ss
-        const match = file.originalname.match(/genshin_export_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})/);
-        if (match) {
-          // Parse "2026-06-22_07-42-09" to valid date string
-          const dateStr = match[1].replace('_', 'T').replace(/-/g, (c: string, i: number) => i > 10 ? ':' : c); // 2026-06-22T07:42:09
-          const parsedDate = new Date(dateStr);
-          if (!isNaN(parsedDate.getTime())) {
-            dateObj = parsedDate;
-          }
+        const parsedDate = parseFilenameTimestamp(file.originalname);
+        if (parsedDate) {
+          dateObj = parsedDate;
         }
       }
       return { file, timestamp: ts, dateObj, originalIndex: idx };
@@ -382,7 +380,7 @@ export class GenshinAccountsService {
     const remainingEntries = fileEntries.slice(1);
     if (remainingEntries.length > 0) {
       this.logger.log(`[Phase 2] Processing remaining ${remainingEntries.length} files...`);
-      const concurrencyLimit = parseInt(process.env.IMPORT_CONCURRENCY_LIMIT || '10', 10);
+      const concurrencyLimit = importConfig.concurrencyLimit;
       for (let i = 0; i < remainingEntries.length; i += concurrencyLimit) {
         const chunk = remainingEntries.slice(i, i + concurrencyLimit);
         const chunkPromises = chunk.map(async (entry) => {

@@ -29,6 +29,11 @@ import { User } from '../auth/decorators/user.decorator';
 import { SkipResponseWrap } from '../common/decorators/skip-response-wrap.decorator';
 import { SettingsService } from '../settings/settings.service';
 import { PatchAccountSettingsDto } from '../settings/dto/patch-account-settings.dto';
+import { importConfig } from '../common/config/import.config';
+
+const importMulterOptions = {
+  limits: { fileSize: importConfig.maxFileSizeBytes },
+};
 
 @Controller('genshin-accounts')
 @UseGuards(JwtAuthGuard)
@@ -100,7 +105,7 @@ export class GenshinAccountsController {
   }
 
   @Post(':id/import')
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(FileInterceptor('file', importMulterOptions))
   importData(
     @User('id') userId: number,
     @Param('id', ParseIntPipe) id: number,
@@ -111,7 +116,9 @@ export class GenshinAccountsController {
   }
 
   @Post(':id/import-bulk')
-  @UseInterceptors(FilesInterceptor('files'))
+  @UseInterceptors(
+    FilesInterceptor('files', importConfig.maxFiles, importMulterOptions),
+  )
   importBulk(
     @User('id') userId: number,
     @Param('id', ParseIntPipe) id: number,
@@ -130,7 +137,9 @@ export class GenshinAccountsController {
   }
 
   @Post(':id/import-bulk-stream')
-  @UseInterceptors(FilesInterceptor('files'))
+  @UseInterceptors(
+    FilesInterceptor('files', importConfig.maxFiles, importMulterOptions),
+  )
   async importBulkStream(
     @User('id') userId: number,
     @Param('id', ParseIntPipe) id: number,
