@@ -15,7 +15,7 @@ async function bootstrap() {
   app.useGlobalInterceptors(new ResponseInterceptor(app.get(Reflector)));
   app.useGlobalFilters(new HttpExceptionFilter());
 
-  const port = process.env.PORT ?? 3000;
+  const port = process.env.PORT ?? 49000;
   await app.listen(port);
   logger.log(`Application is running on: ${await app.getUrl()}`);
 }
