@@ -11,7 +11,18 @@ import { DataPacker, CHARACTER_SCHEMA, WEAPON_SCHEMA } from '../common/utils/dat
 import { DictionaryType } from '@prisma/client';
 
 import { CreateGenshinAccountDto } from './dto/create-genshin-account.dto';
-import { calculateCV, calculateRV } from '../common/utils/artifact.util';
+import {
+  applyArtifactStateUpdates,
+  buildArtifactStateUpdates,
+  calculateCV,
+  calculateRV,
+  isSameArtifactState,
+  mergeArtifactMutableState,
+  toArtifactMutableState,
+  ArtifactCacheEntry,
+  ArtifactImportCache,
+  ArtifactMutableState,
+} from '../common/utils/artifact.util';
 import { SnapshotExportService } from './snapshot-export.service';
 import {
   aggregateTimelineByGroup,
@@ -20,6 +31,23 @@ import {
 import { isCatalogMaterial } from '../common/utils/material-catalog.util';
 import { importConfig } from '../common/config/import.config';
 import { parseFilenameTimestamp } from '../common/utils/gdt-export.util';
+import { resolveImportTimestamp } from '../common/utils/import-timestamp.util';
+
+/** Shape of one artifact inside an uploaded GOOD file (untrusted input). */
+interface RawImportArtifact {
+  setKey?: string;
+  slotKey?: string;
+  level?: number;
+  rarity?: number;
+  mainStatKey?: string;
+  location?: string;
+  lock?: boolean;
+  totalRolls?: number;
+  astralMark?: boolean;
+  elixerCrafted?: boolean;
+  substats?: { key: string; value: number; initialValue?: number }[];
+}
+
 @Injectable()
 export class GenshinAccountsService {
   private readonly logger = new Logger(GenshinAccountsService.name);
@@ -358,14 +386,27 @@ export class GenshinAccountsService {
       return timeDiff === 0 ? a.originalIndex - b.originalIndex : timeDiff;
     });
 
-    const artifactCache = new Map<string, number>();
+    const artifactCache: ArtifactImportCache = new Map();
+
+    // location/lock/astralMark are a *current* value on a shared, content-addressed
+    // row, not a per-snapshot one, so exactly one file may write them: the
+    // chronologically newest, processed last and on its own (Phase 3).
+    // Reconciling from every file would leave the stored value to whichever
+    // member of a concurrent chunk happened to commit last (an arbitrary, often
+    // older, snapshot), and would have several transactions UPDATE overlapping
+    // id sets in different orders - the deadlock the hash-sorted INSERT below is
+    // written to avoid. `getArtifacts()` reads these rows through the *latest*
+    // snapshot's artifactIds, so the newest file is also the only one whose view
+    // is ever displayed.
+    const newestIndex = fileEntries.length - 1;
 
     // Phase 1: The Warm-Up (Process the chronologically first file sequentially)
     if (fileEntries.length > 0) {
       const firstEntry = fileEntries[0];
       this.logger.log(`[Phase 1] Processing absolute oldest file to warm up cache: ${firstEntry.file.originalname}`);
       try {
-        await this.processImport(account.id, firstEntry.file, firstEntry.timestamp, artifactCache);
+        // Only reconciles when it is also the newest file, i.e. a single-file bulk import.
+        await this.processImport(account.id, firstEntry.file, firstEntry.timestamp, artifactCache, newestIndex === 0);
         results.push({ filename: firstEntry.file.originalname, status: 'success' });
         notifyProgress(firstEntry.file.originalname, 'success');
         this.logger.log(`[Phase 1] Successfully processed ${firstEntry.file.originalname}. Caches warmed up!`);
@@ -376,8 +417,8 @@ export class GenshinAccountsService {
       }
     }
 
-    // Phase 2: Concurrent Blast (Process remaining files)
-    const remainingEntries = fileEntries.slice(1);
+    // Phase 2: Concurrent Blast (Process the middle files; the newest is held back for Phase 3)
+    const remainingEntries = fileEntries.slice(1, newestIndex);
     if (remainingEntries.length > 0) {
       this.logger.log(`[Phase 2] Processing remaining ${remainingEntries.length} files...`);
       const concurrencyLimit = importConfig.concurrencyLimit;
@@ -386,7 +427,7 @@ export class GenshinAccountsService {
         const chunkPromises = chunk.map(async (entry) => {
           this.logger.log(`[Phase 2] Processing file: ${entry.file.originalname}...`);
           try {
-            await this.processImport(account.id, entry.file, entry.timestamp, artifactCache);
+            await this.processImport(account.id, entry.file, entry.timestamp, artifactCache, false);
             results.push({ filename: entry.file.originalname, status: 'success' });
             this.logger.log(`[Phase 2] Successfully processed ${entry.file.originalname}`);
           } catch (error: any) {
@@ -405,6 +446,36 @@ export class GenshinAccountsService {
         for (const entry of successEntries) {
           notifyProgress(entry.file.originalname, 'success');
         }
+      }
+    }
+
+    // Phase 3: The chronologically newest file, sequentially and last, so that
+    // its view of location/lock/astralMark is the one that survives and no other
+    // transaction is updating the same rows at the same time.
+    if (newestIndex > 0) {
+      const newestEntry = fileEntries[newestIndex];
+      const { originalname } = newestEntry.file as { originalname: string };
+      this.logger.log(
+        `[Phase 3] Processing newest file to settle live state: ${originalname}`,
+      );
+      try {
+        await this.processImport(
+          account.id,
+          newestEntry.file,
+          newestEntry.timestamp,
+          artifactCache,
+          true,
+        );
+        results.push({ filename: originalname, status: 'success' });
+        notifyProgress(originalname, 'success');
+        this.logger.log(`[Phase 3] Successfully processed ${originalname}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        results.push({ filename: originalname, status: 'error', message });
+        notifyProgress(originalname, 'error', message);
+        this.logger.error(
+          `[Phase 3] Error processing ${originalname}: ${message}`,
+        );
       }
     }
 
@@ -471,10 +542,14 @@ export class GenshinAccountsService {
     };
   }
 
-  private async processImport(accountId: number, file: any, timestamp?: string, artifactCache?: Map<string, number>) {
-    // Determine timestamp
-    const importTimestamp = timestamp ? new Date(isNaN(Number(timestamp)) ? timestamp : Number(timestamp)) : new Date();
-
+  /**
+   * @param reconcileState whether this file may refresh the mutable
+   * location/lock/astralMark columns of artifact rows that already exist. True
+   * for every single-file entry point (the desktop scanner uploads the live
+   * inventory); false for the middle files of a bulk import, where only the
+   * newest snapshot describes the *current* state - see `importBulkData`.
+   */
+  private async processImport(accountId: number, file: any, timestamp?: string, artifactCache?: ArtifactImportCache, reconcileState: boolean = true) {
     this.logger.debug(`Parsing JSON for file (size: ${(file.size / 1024 / 1024).toFixed(2)} MB)...`);
     // Parse JSON
     let parsedData: any;
@@ -484,6 +559,13 @@ export class GenshinAccountsService {
       this.logger.error('Failed to parse JSON file');
       throw new Error('Invalid JSON file format');
     }
+
+    // Resolved only once `parsedData` exists: when the uploader sent no
+    // `timestamp` field we date the snapshot by the GOOD payload's own
+    // timestamp, so scanner builds shipped before that field existed stop
+    // being stamped with server receive time (and start hitting the duplicate
+    // guard below on a re-upload).
+    const importTimestamp = resolveImportTimestamp(timestamp, parsedData?.timestamp);
 
     // Process the parsed data (characters, artifacts, etc.)
     const existingSnapshot = await this.prisma.good.findFirst({
@@ -517,6 +599,10 @@ export class GenshinAccountsService {
     ]);
     this.logger.debug(`Pre-resolving completed.`);
 
+    // Applied to the shared cache only once the transaction has committed, so a
+    // rolled back import cannot teach later files a state that was never stored.
+    const artifactCacheRefresh: ArtifactCacheEntry[] = [];
+
     await this.prisma.$transaction(async (tx) => {
       this.logger.debug(`Starting DB transaction for import...`);
       
@@ -548,9 +634,12 @@ export class GenshinAccountsService {
       this.logger.debug(`Hashing ${numArtifacts} artifacts...`);
       const artifactHashList: string[] = [];
       const artifactsToInsert: any[] = [];
+      // hash -> the live state this snapshot reports for it. Kept separate from
+      // artifactsToInsert because existing rows are never re-inserted.
+      const desiredStateByHash = new Map<string, ArtifactMutableState>();
       
       if (Array.isArray(parsedData.artifacts)) {
-        for (const art of parsedData.artifacts) {
+        for (const art of parsedData.artifacts as RawImportArtifact[]) {
           // Normalize substats for hashing
           const sortedSubstats = Array.isArray(art.substats) 
             ? [...art.substats].sort((a, b) => (a.key || '').localeCompare(b.key || ''))
@@ -567,7 +656,21 @@ export class GenshinAccountsService {
           
           const hash = crypto.createHash('sha256').update(JSON.stringify(hashObj)).digest('hex');
           artifactHashList.push(hash);
-          
+
+          const desiredState = toArtifactMutableState(art);
+          // Two artifacts with identical stats share one row, so their live
+          // state has to be collapsed. Merge rather than let the first
+          // occurrence win: the uploaded array's order is not stable (irminsul
+          // iterates a HashMap), so first-wins would flip the shared row
+          // between uploads and issue an UPDATE on every unchanged re-import.
+          const previous = desiredStateByHash.get(hash);
+          desiredStateByHash.set(
+            hash,
+            previous
+              ? mergeArtifactMutableState(previous, desiredState)
+              : desiredState,
+          );
+
           artifactsToInsert.push({
             hash,
             genshinAccountId: accountId,
@@ -576,10 +679,8 @@ export class GenshinAccountsService {
             level: art.level || 0,
             rarity: art.rarity || 5,
             mainStatKey: art.mainStatKey || '',
-            location: art.location || '',
-            lock: Boolean(art.lock),
+            ...desiredState,
             totalRolls: art.totalRolls || 0,
-            astralMark: Boolean(art.astralMark),
             elixerCrafted: Boolean(art.elixerCrafted),
             substats: art.substats || [],
             cv: calculateCV(art.substats || []),
@@ -591,9 +692,16 @@ export class GenshinAccountsService {
       // Deduplicate artifactsToInsert in memory
       const uniqueArtifactsMap = new Map();
       for (const art of artifactsToInsert) {
-        if (!uniqueArtifactsMap.has(art.hash)) {
-          if (!artifactCache || !artifactCache.has(art.hash)) {
-            uniqueArtifactsMap.set(art.hash, art);
+        const hash = art.hash as string;
+        if (!uniqueArtifactsMap.has(hash)) {
+          if (!artifactCache || !artifactCache.has(hash)) {
+            // Insert the *merged* state, not this occurrence's, so a freshly
+            // inserted row already holds what the reconciliation below would
+            // otherwise immediately UPDATE it to.
+            uniqueArtifactsMap.set(hash, {
+              ...art,
+              ...desiredStateByHash.get(hash),
+            });
           }
         }
       }
@@ -614,46 +722,93 @@ export class GenshinAccountsService {
       this.logger.debug(`Resolving artifact hashes to DB IDs...`);
       // Resolve artifact hashes to IDs
       let artifactIds: number[] = [];
+      const resolvedByHash = new Map<string, ArtifactCacheEntry>();
       if (artifactHashList.length > 0) {
-        const resolvedArtifacts: { id: number, hash: string }[] = [];
         const hashesToQuery: string[] = [];
-        
-        if (artifactCache) {
-          for (const h of artifactHashList) {
-            const cachedId = artifactCache.get(h);
-            if (cachedId) {
-              resolvedArtifacts.push({ id: cachedId, hash: h });
-            } else {
-              hashesToQuery.push(h);
-            }
+        const seenHashes = new Set<string>();
+
+        for (const h of artifactHashList) {
+          if (seenHashes.has(h)) continue;
+          seenHashes.add(h);
+          const cached = artifactCache?.get(h);
+          if (cached) {
+            resolvedByHash.set(h, cached);
+          } else {
+            hashesToQuery.push(h);
           }
-        } else {
-          hashesToQuery.push(...artifactHashList);
         }
 
         if (hashesToQuery.length > 0) {
           const CHUNK_SIZE = 500;
-          const chunkPromises: any[] = [];
+          const chunkPromises: Promise<ArtifactCacheEntry[]>[] = [];
           for (let i = 0; i < hashesToQuery.length; i += CHUNK_SIZE) {
             const chunk = hashesToQuery.slice(i, i + CHUNK_SIZE);
             chunkPromises.push(
               tx.accountArtifact.findMany({
                 where: { genshinAccountId: accountId, hash: { in: chunk } },
-                select: { id: true, hash: true }
+                // The mutable columns come back with the id: they are what the
+                // reconciliation below diffs against this snapshot.
+                select: { id: true, hash: true, location: true, lock: true, astralMark: true }
               })
             );
           }
           const results = await Promise.all(chunkPromises);
-          results.forEach((res: any[]) => {
-            resolvedArtifacts.push(...res);
-            if (artifactCache) {
-              res.forEach(a => artifactCache.set(a.hash, a.id));
+          for (const res of results) {
+            for (const row of res) {
+              resolvedByHash.set(row.hash, row);
+              artifactCache?.set(row.hash, row);
             }
-          });
+          }
         }
         
-        const hashToId = new Map(resolvedArtifacts.map(a => [a.hash, a.id]));
-        artifactIds = artifactHashList.map(h => hashToId.get(h)!).filter((x): x is number => typeof x === 'number');
+        artifactIds = artifactHashList
+          .map(h => resolvedByHash.get(h)?.id)
+          .filter((x): x is number => typeof x === 'number');
+      }
+
+      // The content hash covers only the artifact's identity (set/slot/rarity/
+      // level/mainstat/substats), so an existing row still carries the
+      // location/lock/astralMark written by whichever snapshot first inserted
+      // it. Re-equipping does not change the hash, so it has to be written here
+      // or "equipped on" freezes at the first value ever seen. Levelling, which
+      // IS hashed, still correctly mints a new row and is untouched by this.
+      const artifactStateRows: {
+        id: number;
+        current: ArtifactMutableState;
+        desired: ArtifactMutableState;
+      }[] = [];
+      if (reconcileState) {
+        for (const entry of resolvedByHash.values()) {
+          const desired = desiredStateByHash.get(entry.hash);
+          if (desired) {
+            artifactStateRows.push({ id: entry.id, current: entry, desired });
+          }
+        }
+      }
+
+      // Only rows that actually moved are written, so re-uploading an unchanged
+      // inventory still issues zero UPDATEs.
+      const artifactStateUpdates = buildArtifactStateUpdates(artifactStateRows);
+      if (artifactStateUpdates.length > 0) {
+        const refreshed = await applyArtifactStateUpdates(
+          artifactStateUpdates,
+          (ids, state) =>
+            tx.accountArtifact.updateMany({
+              where: { genshinAccountId: accountId, id: { in: ids } },
+              data: state
+            })
+        );
+        this.logger.debug(`Refreshed live state on ${refreshed} artifact(s).`);
+
+        // Queue the cross-file cache up to match what was just written.
+        if (artifactCache) {
+          for (const entry of resolvedByHash.values()) {
+            const desired = desiredStateByHash.get(entry.hash);
+            if (desired && !isSameArtifactState(entry, desired)) {
+              artifactCacheRefresh.push({ ...entry, ...desired });
+            }
+          }
+        }
       }
 
       this.logger.debug(`Compressing payload...`);
@@ -684,7 +839,13 @@ export class GenshinAccountsService {
       maxWait: 15000, // 15 seconds to wait for a connection
       timeout: 120000, // 120 seconds to finish the transaction
     });
-    
+
+    if (artifactCache) {
+      for (const entry of artifactCacheRefresh) {
+        artifactCache.set(entry.hash, entry);
+      }
+    }
+
     return {
       message: 'Import processed successfully',
       timestamp: importTimestamp,
@@ -1026,6 +1187,23 @@ export class GenshinAccountsService {
     };
   }
 
+  /**
+   * Day-by-day mora / primogem / fodder movement for one month.
+   *
+   * Mora, primogems and the extraction materials are genuinely historical: they
+   * come from each day's `Good.materials`.
+   *
+   * The 3-star / 4-star fodder columns are NOT. "Fodder" is defined as `!lock &&
+   * location === ''`, and those two columns live on the shared, content
+   * addressed `AccountArtifact` row, which every import refreshes to the live
+   * inventory - only the *set* of artifact ids per day is historical. So a past
+   * day is counted by asking "which of the pieces that existed that day are
+   * unlocked and unequipped TODAY", and locking or equipping a piece now shifts
+   * the count for every past day it appears in. The response therefore must not
+   * be presented as an immutable record of that month; see the audit notes for
+   * `r-backend` #1 (freezing it means persisting per-snapshot state on `Good`,
+   * a schema change).
+   */
   async getMonthlyAnalysis(userId: number, accountId: number, month: number, year: number) {
     const account = await this.prisma.genshinAccount.findUnique({
       where: { id: accountId, userId },
@@ -1075,6 +1253,9 @@ export class GenshinAccountsService {
     const idToArtInfo = new Map<number, { rarity: number; lock: boolean; location: string }>();
 
     if (idArray.length > 0) {
+      // `rarity` is immutable (it is inside the content hash), but `lock` and
+      // `location` are live columns: this map is today's state, applied to every
+      // day below. See the note on getMonthlyAnalysis.
       const dbArtifacts = await this.prisma.accountArtifact.findMany({
         where: { genshinAccountId: accountId, id: { in: idArray } },
         select: { id: true, rarity: true, lock: true, location: true }

@@ -285,6 +285,24 @@ export class SnapshotExportService implements OnModuleInit, OnModuleDestroy {
     return new Map(artifacts.map((a) => [a.id, a]));
   }
 
+  /**
+   * Rebuilds a GOOD file from one stored snapshot.
+   *
+   * KNOWN LIMITATION - the exported `location` and `lock` are CURRENT, not
+   * historical. Everything else here comes from the `Good` row and is frozen at
+   * capture time, but artifacts are content-addressed: the snapshot stores only
+   * `artifactIds`, and those two columns live on the shared `AccountArtifact`
+   * row, which every subsequent import refreshes to the live inventory. So an
+   * export of a six-month-old snapshot lists that snapshot's artifacts with
+   * today's equipped-on / locked flags, and re-exporting the same snapshot after
+   * the scanner uploads again can produce a different file.
+   *
+   * (Before live-state reconciliation these columns were frozen at whatever the
+   * first import that inserted the row happened to see - equally wrong for
+   * history, merely stable. Per-snapshot history would mean persisting the state
+   * alongside `artifactIds` on `Good`, which is a schema change; see the audit
+   * notes for `r-backend` #1.)
+   */
   buildGoodExport(
     good: Good,
     artifactMap: Map<number, AccountArtifact>,
@@ -299,6 +317,7 @@ export class SnapshotExportService implements OnModuleInit, OnModuleDestroy {
         level: a.level,
         rarity: a.rarity,
         mainStatKey: a.mainStatKey,
+        // Current state, not this snapshot's - see the note on buildGoodExport.
         location: a.location,
         lock: a.lock,
         substats: Array.isArray(a.substats)
