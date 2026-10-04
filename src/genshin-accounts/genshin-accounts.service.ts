@@ -1188,12 +1188,12 @@ export class GenshinAccountsService {
   }
 
   /**
-   * Day-by-day mora / primogem / fodder movement for one month.
+   * Day-by-day mora / primogem / spare-artifact movement for one month.
    *
    * Mora, primogems and the extraction materials are genuinely historical: they
    * come from each day's `Good.materials`.
    *
-   * The 3-star / 4-star fodder columns are NOT. "Fodder" is defined as `!lock &&
+   * The 3-star / 4-star spare-artifact columns are NOT. A spare artifact is `!lock &&
    * location === ''`, and those two columns live on the shared, content
    * addressed `AccountArtifact` row, which every import refreshes to the live
    * inventory - only the *set* of artifact ids per day is historical. So a past

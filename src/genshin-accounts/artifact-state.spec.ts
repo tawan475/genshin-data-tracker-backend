@@ -378,7 +378,7 @@ describe('artifact import state reconciliation', () => {
 });
 
 /**
- * Stat-identical pieces (level-0 fodder with one substat, most of all) collapse
+ * Stat-identical pieces (level-0 spare pieces with one substat, most of all) collapse
  * onto a single content-addressed row, so one live state has to win. It must not
  * be "whichever came first in the uploaded array": irminsul builds that array by
  * iterating a HashMap, so its order changes between runs, and an order-dependent
@@ -401,7 +401,7 @@ describe('duplicate-hash collapse', () => {
   });
 
   // Same stats, so one row - but one copy is equipped and locked and the other
-  // is loose fodder.
+  // is a loose spare piece.
   const equipped = {
     ...baseArtifact,
     location: 'Amber',

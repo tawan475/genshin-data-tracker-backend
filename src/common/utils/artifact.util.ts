@@ -85,13 +85,13 @@ export function toArtifactMutableState(raw: {
 /**
  * Collapses the live state of two artifacts that share one content hash.
  *
- * Stat-identical pieces (routine for level-0 3-star / 4-star fodder with a single
+ * Stat-identical pieces (routine for level-0 3-star / 4-star spare pieces with a single
  * substat) are one row, so one of their states has to win. Picking the first
  * occurrence would make the winner depend on the order of the uploaded
  * `artifacts` array, which is not stable - irminsul builds it by iterating a
  * `HashMap` - so a pair that differs only in `lock` would rewrite the shared row
  * on every upload, turning "unchanged inventory costs zero writes" into churn
- * and jittering the `!lock && location === ''` fodder count.
+ * and jittering the `!lock && location === ''` spare-artifact count.
  *
  * Merging is commutative and associative, so the result depends only on the
  * *set* of duplicates, never on their order, and it says what a user means:
